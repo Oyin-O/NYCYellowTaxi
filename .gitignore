@@ -1,0 +1,10 @@
+venv/
+.idea/
+__pycache__/
+.aws-sam/
+*.parquet
+.env
+package/
+*.json
+*.zip
+.git
