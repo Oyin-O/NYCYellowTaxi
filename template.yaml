@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NYC Yellow Taxi Data Pipeline - Event-Driven Bronze to Silver
+
+Resources:
+  # ==================== S3 BUCKETS ====================
+
+  BronzeTaxiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nyc-taxi-bronze-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+
+  SilverTaxiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nyc-taxi-silver-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 730
+
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nyc-taxi-glue-scripts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ==================== LAMBDA FUNCTION ====================
+
+  TaxiExtractorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-bronze-ingest
+      Description: Downloads NYC Yellow Taxi data to Bronze S3 and triggers crawler
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 512
+      EphemeralStorage:
+        Size: 1024
+      Environment:
+        Variables:
+          BUCKET: !Ref BronzeTaxiBucket
+          BASE_URL: https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{year_month}.parquet
+          BRONZE_CRAWLER_NAME: !Ref BronzeTaxiCrawler
+
+      Policies:
+        # Read from NYC public bucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - arn:aws:s3:::nyc-tlc
+                - arn:aws:s3:::nyc-tlc/*
+
+        # Write to Bronze bucket
+        - S3CrudPolicy:
+            BucketName: !Ref BronzeTaxiBucket
+
+        # Start Glue Crawler
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:StartCrawler
+                - glue:GetCrawler
+              Resource:
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${BronzeTaxiCrawler}
+
+      Events:
+        MonthlySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 5 * ? *)
+            Description: Run on 5th of every month at 2 AM UTC
+            Enabled: true
+
+  # ==================== GLUE DATABASE ====================
+
+  TaxiDataCatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: nyc_taxi_db
+        Description: Glue Data Catalog for NYC Yellow Taxi pipeline (Bronze and Silver layers)
+
+  # ==================== GLUE IAM ROLE ====================
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-glue-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+      Policies:
+        # Glue Catalog Access
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:CreateDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/nyc_taxi_db
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/nyc_taxi_db/*
+
+        # S3 Access
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BronzeTaxiBucket.Arn
+                  - !Sub ${BronzeTaxiBucket.Arn}/*
+                  - !GetAtt SilverTaxiBucket.Arn
+                  - !Sub ${SilverTaxiBucket.Arn}/*
+                  - !GetAtt GlueScriptsBucket.Arn
+                  - !Sub ${GlueScriptsBucket.Arn}/*
+
+        # CloudWatch Logs
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
+
+  # ==================== GLUE CRAWLERS ====================
+
+  BronzeTaxiCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-bronze-crawler
+      Description: Crawls Bronze layer to catalog raw NYC taxi data
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref TaxiDataCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${BronzeTaxiBucket}/yellow/
+      TablePrefix: bronze_
+      SchemaChangePolicy:
+        UpdateBehavior: LOG
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+
+  SilverTaxiCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-silver-crawler
+      Description: Crawls Silver layer to catalog cleaned NYC taxi data
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref TaxiDataCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${SilverTaxiBucket}/yellow/
+      TablePrefix: silver_
+      SchemaChangePolicy:
+        UpdateBehavior: LOG
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+
+  # ==================== GLUE ETL JOB ====================
+
+  TaxiSilverTransformationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${AWS::StackName}-bronze-to-silver
+      Description: Transforms NYC Yellow Taxi data from Bronze to Silver layer with data quality checks
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptsBucket}/scripts/bronze_to_silver_transformation.py
+        PythonVersion: "3"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 2
+      Timeout: 60
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--TempDir": !Sub s3://${GlueScriptsBucket}/temp/
+        "--BRONZE_BUCKET": !Ref BronzeTaxiBucket
+        "--SILVER_BUCKET": !Ref SilverTaxiBucket
+        "--DATABASE_NAME": !Ref TaxiDataCatalogDatabase
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # ==================== GLUE TRIGGERS ====================
+
+  SilverETLJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub ${AWS::StackName}-start-silver-etl
+      Type: CONDITIONAL
+      Description: Auto-start ETL job when Bronze crawler succeeds
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref TaxiSilverTransformationJob
+          Arguments:
+            "--job-bookmark-option": "job-bookmark-enable"
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref BronzeTaxiCrawler
+            CrawlState: SUCCEEDED
+
+  SilverCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub ${AWS::StackName}-start-silver-crawler
+      Type: CONDITIONAL
+      Description: Auto-start Silver crawler when ETL job succeeds
+      StartOnCreation: true
+      Actions:
+        - CrawlerName: !Ref SilverTaxiCrawler
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref TaxiSilverTransformationJob
+            State: SUCCEEDED
+
+  # ==================== CLOUDWATCH ALARMS ====================
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-errors
+      AlarmDescription: Alert when Lambda function fails
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TaxiExtractorFunction
+      TreatMissingData: notBreaching
+
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-glue-job-failures
+      AlarmDescription: Alert when Glue ETL job fails
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Namespace: Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ==================== OUTPUTS ====================
+
+Outputs:
+  BronzeBucketName:
+    Description: Bronze S3 Bucket Name
+    Value: !Ref BronzeTaxiBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-BronzeBucket
+
+  SilverBucketName:
+    Description: Silver S3 Bucket Name
+    Value: !Ref SilverTaxiBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-SilverBucket
+
+  GlueScriptsBucketName:
+    Description: Glue Scripts Bucket Name
+    Value: !Ref GlueScriptsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ScriptsBucket
+
+  GlueDatabaseName:
+    Description: Glue Database Name
+    Value: !Ref TaxiDataCatalogDatabase
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueDatabase
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt TaxiExtractorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaArn
+
+  LambdaFunctionName:
+    Description: Lambda Function Name
+    Value: !Ref TaxiExtractorFunction
+
+  GlueJobName:
+    Description: Glue ETL Job Name
+    Value: !Ref TaxiSilverTransformationJob
+
+  BronzeCrawlerName:
+    Description: Bronze Crawler Name
+    Value: !Ref BronzeTaxiCrawler
+
+  SilverCrawlerName:
+    Description: Silver Crawler Name
+    Value: !Ref SilverTaxiCrawler
+
+  DataCatalogConsoleURL:
+    Description: Glue Data Catalog Console URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/glue/home?region=${AWS::Region}#/v2/data-catalog/databases/view/${TaxiDataCatalogDatabase}
+
+  GlueJobConsoleURL:
+    Description: Glue Job Console URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/gluestudio/home?region=${AWS::Region}#/editor/job/${TaxiSilverTransformationJob}/graph

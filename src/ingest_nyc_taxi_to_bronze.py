@@ -76,7 +76,7 @@ class TaxiDownloader:
 
     def upload_to_bronze(self, local_file: str, year_month: str):
         filename = os.path.basename(local_file)
-        s3_key = f'bronze/yellow/year={year_month.split("-")[0]}/month={year_month.split("-")[1]}/{filename}'
+        s3_key = f'yellow/year={year_month.split("-")[0]}/month={year_month.split("-")[1]}/{filename}'
 
         attempt = 0
         while attempt < self.max_retries:
