@@ -1,0 +1,314 @@
+{
+  "Comment": "NYC Taxi Data Pipeline - Complete Flow with Parallel Gold Jobs",
+  "StartAt": "IngestBronzeData",
+  "States": {
+    "IngestBronzeData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BronzeIngestLambda}",
+        "Payload": {}
+      },
+      "ResultPath": "$.ingestResult",
+      "Next": "StartBronzeCrawler",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Comment": "Download NYC taxi data to Bronze S3"
+    },
+
+    "StartBronzeCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "${BronzeCrawlerName}"
+      },
+      "Next": "WaitForBronzeCrawler",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Comment": "Start Bronze crawler to catalog raw data"
+    },
+
+    "WaitForBronzeCrawler": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckBronzeCrawler"
+    },
+
+    "CheckBronzeCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "${BronzeCrawlerName}"
+      },
+      "Next": "IsBronzeCrawlerComplete",
+      "ResultPath": "$.crawlerStatus"
+    },
+
+    "IsBronzeCrawlerComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.crawlerStatus.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "StartSilverETL"
+        }
+      ],
+      "Default": "WaitForBronzeCrawler"
+    },
+
+    "StartSilverETL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${SilverETLJobName}"
+      },
+      "Next": "StartSilverCrawler",
+      "ResultPath": "$.silverJobResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Comment": "Transform Bronze to Silver layer"
+    },
+
+    "StartSilverCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "${SilverCrawlerName}"
+      },
+      "Next": "WaitForSilverCrawler",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Comment": "Catalog Silver layer data"
+    },
+
+    "WaitForSilverCrawler": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckSilverCrawler"
+    },
+
+    "CheckSilverCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "${SilverCrawlerName}"
+      },
+      "Next": "IsSilverCrawlerComplete",
+      "ResultPath": "$.crawlerStatus"
+    },
+
+    "IsSilverCrawlerComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.crawlerStatus.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "StartGoldJobs"
+        }
+      ],
+      "Default": "WaitForSilverCrawler"
+    },
+
+    "StartGoldJobs": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "GoldFinanceJob",
+          "States": {
+            "GoldFinanceJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GoldFinanceJobName}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "GoldOperationsJob",
+          "States": {
+            "GoldOperationsJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GoldOperationsJobName}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "StartGoldCrawlers",
+      "ResultPath": "$.goldJobResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.goldJobsError",
+          "Next": "GoldJobsFailed"
+        }
+      ],
+      "Comment": "Run Gold Finance and Operations jobs in parallel"
+    },
+
+    "GoldJobsFailed": {
+      "Type": "Fail",
+      "Error": "GoldLayerCreationFailed",
+      "Cause": "One or both Gold layer jobs failed. Check CloudWatch logs."
+    },
+
+    "StartGoldCrawlers": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "GoldFinanceCrawler",
+          "States": {
+            "GoldFinanceCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${GoldCrawlerName}"
+              },
+              "Next": "WaitForGoldFinanceCrawler"
+            },
+            "WaitForGoldFinanceCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckGoldFinanceCrawler"
+            },
+            "CheckGoldFinanceCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${GoldCrawlerName}"
+              },
+              "Next": "IsGoldFinanceCrawlerComplete",
+              "ResultPath": "$.crawlerStatus"
+            },
+            "IsGoldFinanceCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.crawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "FinanceCrawlerComplete"
+                }
+              ],
+              "Default": "WaitForGoldFinanceCrawler"
+            },
+            "FinanceCrawlerComplete": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "GoldOperationsCrawler",
+          "States": {
+            "GoldOperationsCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${GoldOperationsCrawlerName}"
+              },
+              "Next": "WaitForGoldOperationsCrawler"
+            },
+            "WaitForGoldOperationsCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckGoldOperationsCrawler"
+            },
+            "CheckGoldOperationsCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${GoldOperationsCrawlerName}"
+              },
+              "Next": "IsGoldOperationsCrawlerComplete",
+              "ResultPath": "$.crawlerStatus"
+            },
+            "IsGoldOperationsCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.crawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "OperationsCrawlerComplete"
+                }
+              ],
+              "Default": "WaitForGoldOperationsCrawler"
+            },
+            "OperationsCrawlerComplete": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "PipelineSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.crawlerError",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Comment": "Run both Gold crawlers in parallel"
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "Pipeline completed - Gold Finance & Operations layers ready"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineExecutionFailed",
+      "Cause": "Pipeline stage failed - check CloudWatch logs"
+    }
+  }
+}

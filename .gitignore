@@ -5,7 +5,6 @@ __pycache__/
 *.parquet
 .env
 package/
-*.json
 *.zip
 .git
 *.toml
