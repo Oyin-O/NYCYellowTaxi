@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: NYC Yellow Taxi Data Pipeline - Event-Driven Bronze to Silver
+Description: NYC Yellow Taxi Data Pipeline - Bronze to Silver to Gold Finance
 
 Resources:
   # ==================== S3 BUCKETS ====================
@@ -36,6 +36,21 @@ Resources:
             Status: Enabled
             ExpirationInDays: 730
 
+  GoldTaxiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nyc-taxi-gold-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 1095
+
   GlueScriptsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -43,13 +58,13 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
 
-  # ==================== LAMBDA FUNCTION ====================
+  # ==================== LAMBDA FUNCTIONS ====================
 
   TaxiExtractorFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-bronze-ingest
-      Description: Downloads NYC Yellow Taxi data to Bronze S3 and triggers crawler
+      Description: Downloads NYC Yellow Taxi data to Bronze S3 and triggers Step Functions pipeline
       CodeUri: src/
       Handler: lambda_function.lambda_handler
       Runtime: python3.11
@@ -61,10 +76,8 @@ Resources:
         Variables:
           BUCKET: !Ref BronzeTaxiBucket
           BASE_URL: https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{year_month}.parquet
-          BRONZE_CRAWLER_NAME: !Ref BronzeTaxiCrawler
 
       Policies:
-        # Read from NYC public bucket
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -75,27 +88,20 @@ Resources:
                 - arn:aws:s3:::nyc-tlc
                 - arn:aws:s3:::nyc-tlc/*
 
-        # Write to Bronze bucket
-        - S3CrudPolicy:
-            BucketName: !Ref BronzeTaxiBucket
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectAcl
+                - s3:ListBucket
+              Resource:
+                - !GetAtt BronzeTaxiBucket.Arn
+                - !Sub "${BronzeTaxiBucket.Arn}/*"
 
-        # Start Glue Crawler
-        - Version: '2012-10-17'
-          Statement:
             - Effect: Allow
               Action:
                 - glue:StartCrawler
-                - glue:GetCrawler
-              Resource:
-                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${BronzeTaxiCrawler}
+              Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${BronzeTaxiCrawler}"
 
-      Events:
-        MonthlySchedule:
-          Type: Schedule
-          Properties:
-            Schedule: cron(0 2 5 * ? *)
-            Description: Run on 5th of every month at 2 AM UTC
-            Enabled: true
 
   # ==================== GLUE DATABASE ====================
 
@@ -105,7 +111,7 @@ Resources:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
         Name: nyc_taxi_db
-        Description: Glue Data Catalog for NYC Yellow Taxi pipeline (Bronze and Silver layers)
+        Description: Glue Data Catalog for NYC Yellow Taxi pipeline (Bronze, Silver, and Gold layers)
 
   # ==================== GLUE IAM ROLE ====================
 
@@ -125,7 +131,6 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
 
       Policies:
-        # Glue Catalog Access
         - PolicyName: GlueCatalogAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -147,7 +152,6 @@ Resources:
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/nyc_taxi_db
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/nyc_taxi_db/*
 
-        # S3 Access
         - PolicyName: S3Access
           PolicyDocument:
             Version: "2012-10-17"
@@ -163,10 +167,11 @@ Resources:
                   - !Sub ${BronzeTaxiBucket.Arn}/*
                   - !GetAtt SilverTaxiBucket.Arn
                   - !Sub ${SilverTaxiBucket.Arn}/*
+                  - !GetAtt GoldTaxiBucket.Arn
+                  - !Sub ${GoldTaxiBucket.Arn}/*
                   - !GetAtt GlueScriptsBucket.Arn
                   - !Sub ${GlueScriptsBucket.Arn}/*
 
-        # CloudWatch Logs
         - PolicyName: CloudWatchLogs
           PolicyDocument:
             Version: "2012-10-17"
@@ -193,10 +198,10 @@ Resources:
           - Path: !Sub s3://${BronzeTaxiBucket}/yellow/
       TablePrefix: bronze_
       SchemaChangePolicy:
-        UpdateBehavior: LOG
-        DeleteBehavior: LOG
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
       RecrawlPolicy:
-        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+        RecrawlBehavior: CRAWL_EVERYTHING
       Configuration: |
         {
           "Version": 1.0,
@@ -220,7 +225,7 @@ Resources:
         UpdateBehavior: LOG
         DeleteBehavior: LOG
       RecrawlPolicy:
-        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+        RecrawlBehavior: CRAWL_EVERYTHING
       Configuration: |
         {
           "Version": 1.0,
@@ -229,7 +234,41 @@ Resources:
           }
         }
 
-  # ==================== GLUE ETL JOB ====================
+  GoldTaxiCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-gold-crawler
+      Description: Crawls Gold layer to catalog business-ready data
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref TaxiDataCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${GoldTaxiBucket}/finance/
+      TablePrefix: gold_
+      SchemaChangePolicy:
+        UpdateBehavior: LOG
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+
+  GoldOperationsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-gold-operations-crawler
+      Description: Crawls Gold layer to catalog business-ready data
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref TaxiDataCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${GoldTaxiBucket}/operations/
+      TablePrefix: gold_
+      SchemaChangePolicy:
+        UpdateBehavior: LOG
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+
+  # ==================== GLUE ETL JOBS ====================
 
   TaxiSilverTransformationJob:
     Type: AWS::Glue::Job
@@ -252,6 +291,7 @@ Resources:
         "--enable-metrics": "true"
         "--enable-spark-ui": "true"
         "--enable-continuous-cloudwatch-log": "true"
+        "--enable-glue-datacatalog": "true"
         "--TempDir": !Sub s3://${GlueScriptsBucket}/temp/
         "--BRONZE_BUCKET": !Ref BronzeTaxiBucket
         "--SILVER_BUCKET": !Ref SilverTaxiBucket
@@ -259,41 +299,148 @@ Resources:
       ExecutionProperty:
         MaxConcurrentRuns: 1
 
-  # ==================== GLUE TRIGGERS ====================
-
-  SilverETLJobTrigger:
-    Type: AWS::Glue::Trigger
+  GoldFinanceJob:
+    Type: AWS::Glue::Job
     Properties:
-      Name: !Sub ${AWS::StackName}-start-silver-etl
-      Type: CONDITIONAL
-      Description: Auto-start ETL job when Bronze crawler succeeds
-      StartOnCreation: true
-      Actions:
-        - JobName: !Ref TaxiSilverTransformationJob
-          Arguments:
-            "--job-bookmark-option": "job-bookmark-enable"
-      Predicate:
-        Logical: AND
-        Conditions:
-          - LogicalOperator: EQUALS
-            CrawlerName: !Ref BronzeTaxiCrawler
-            CrawlState: SUCCEEDED
+      Name: !Sub ${AWS::StackName}-silver-to-gold-finance
+      Description: Creates Gold Finance layer with revenue and payment analytics
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptsBucket}/scripts/silver_to_gold_finance.py
+        PythonVersion: "3"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 2
+      Timeout: 60
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-glue-datacatalog": "true"
+        "--TempDir": !Sub s3://${GlueScriptsBucket}/temp/
+        "--SILVER_BUCKET": !Ref SilverTaxiBucket
+        "--GOLD_BUCKET": !Ref GoldTaxiBucket
+        "--DATABASE_NAME": !Ref TaxiDataCatalogDatabase
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
 
-  SilverCrawlerTrigger:
-    Type: AWS::Glue::Trigger
+
+  GoldOperationsJob:
+    Type: AWS::Glue::Job
     Properties:
-      Name: !Sub ${AWS::StackName}-start-silver-crawler
-      Type: CONDITIONAL
-      Description: Auto-start Silver crawler when ETL job succeeds
-      StartOnCreation: true
-      Actions:
-        - CrawlerName: !Ref SilverTaxiCrawler
-      Predicate:
-        Logical: AND
-        Conditions:
-          - LogicalOperator: EQUALS
-            JobName: !Ref TaxiSilverTransformationJob
-            State: SUCCEEDED
+      Name: !Sub ${AWS::StackName}-silver-to-operations
+      Description: Creates Gold Operations layer with revenue and payment analytics
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptsBucket}/scripts/silver_to_gold_operations.py
+        PythonVersion: "3"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 2
+      Timeout: 60
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-glue-datacatalog": "true"
+        "--TempDir": !Sub s3://${GlueScriptsBucket}/temp/
+        "--SILVER_BUCKET": !Ref SilverTaxiBucket
+        "--GOLD_BUCKET": !Ref GoldTaxiBucket
+        "--DATABASE_NAME": !Ref TaxiDataCatalogDatabase
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # ==================== STEP FUNCTIONS ====================
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/stepfunctions/${AWS::StackName}-pipeline
+      RetentionInDays: 30
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-stepfunctions-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsGlueAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/*
+
+        - PolicyName: StepFunctionsLambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TaxiExtractorFunction.Arn
+
+
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  TaxiDataPipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      DefinitionUri: statemachine/taxi_pipeline.asl.json
+      DefinitionSubstitutions:
+        BronzeIngestLambda: !Ref TaxiExtractorFunction
+        BronzeCrawlerName: !Ref BronzeTaxiCrawler
+        SilverETLJobName: !Ref TaxiSilverTransformationJob
+        SilverCrawlerName: !Ref SilverTaxiCrawler
+        GoldFinanceJobName: !Ref GoldFinanceJob
+        GoldOperationsJobName: !Ref GoldOperationsJob
+        GoldCrawlerName: !Ref GoldTaxiCrawler
+        GoldOperationsCrawlerName: !Ref GoldOperationsCrawler
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      Type: STANDARD
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
 
   # ==================== CLOUDWATCH ALARMS ====================
 
@@ -328,6 +475,145 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
+
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-pipeline-failures
+      AlarmDescription: Alert when Step Functions execution fails
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TaxiDataPipelineStateMachine
+      TreatMissingData: notBreaching
+
+  MonthlyPipelineTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-monthly-trigger
+      Description: Trigger taxi data pipeline on 26th of every month
+      ScheduleExpression: cron(30 00 09 * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !Ref TaxiDataPipelineStateMachine
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+          Id: TaxiPipelineTarget
+
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStepFunctions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref TaxiDataPipelineStateMachine
+
+# SNS Topic for all pipeline notifications
+PipelineNotificationTopic:
+  Type: AWS::SNS::Topic
+  Properties:
+    TopicName: !Sub ${AWS::StackName}-pipeline-alerts
+    DisplayName: NYC Taxi Pipeline Alerts
+    Subscription:
+      - Endpoint: your-email@example.com  # CHANGE THIS
+        Protocol: email
+
+# EventBridge Rule: Pipeline Failed
+PipelineFailureRule:
+  Type: AWS::Events::Rule
+  Properties:
+    Name: !Sub ${AWS::StackName}-pipeline-failure
+    State: ENABLED
+    EventPattern:
+      source:
+        - aws.states
+      detail-type:
+        - Step Functions Execution Status Change
+      detail:
+        status:
+          - FAILED
+          - TIMED_OUT
+          - ABORTED
+        stateMachineArn:
+          - !Ref TaxiPipelineStateMachine
+    Targets:
+      - Arn: !Ref PipelineNotificationTopic
+        Id: FailureNotification
+        InputTransformer:
+          InputPathsMap:
+            executionArn: $.detail.executionArn
+            status: $.detail.status
+            name: $.detail.name
+            stopDate: $.detail.stopDate
+          InputTemplate: |
+            {
+              "default": "🚨 NYC Taxi Pipeline FAILED",
+              "email": "NYC Taxi Data Pipeline Alert\n\nStatus: <status>\nExecution: <name>\nTime: <stopDate>\n\nView details:\nhttps://console.aws.amazon.com/states/home?region=eu-west-2#/executions/details/<executionArn>"
+            }
+
+# EventBridge Rule: Pipeline Succeeded
+PipelineSuccessRule:
+  Type: AWS::Events::Rule
+  Properties:
+    Name: !Sub ${AWS::StackName}-pipeline-success
+    State: ENABLED
+    EventPattern:
+      source:
+        - aws.states
+      detail-type:
+        - Step Functions Execution Status Change
+      detail:
+        status:
+          - SUCCEEDED
+        stateMachineArn:
+          - !Ref TaxiPipelineStateMachine
+    Targets:
+      - Arn: !Ref PipelineNotificationTopic
+        Id: SuccessNotification
+        InputTransformer:
+          InputPathsMap:
+            name: $.detail.name
+            stopDate: $.detail.stopDate
+          InputTemplate: |
+            {
+              "default": "✅ NYC Taxi Pipeline completed successfully",
+              "email": "NYC Taxi Data Pipeline\n\nStatus: SUCCESS\nExecution: <name>\nCompleted: <stopDate>"
+            }
+
+# Permission for EventBridge to publish to SNS
+SNSTopicPolicy:
+  Type: AWS::SNS::TopicPolicy
+  Properties:
+    Topics:
+      - !Ref PipelineNotificationTopic
+    PolicyDocument:
+      Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sns:Publish
+          Resource: !Ref PipelineNotificationTopic
+
+
 # ==================== OUTPUTS ====================
 
 Outputs:
@@ -343,6 +629,12 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-SilverBucket
 
+  GoldBucketName:
+    Description: Gold S3 Bucket Name (Finance layer)
+    Value: !Ref GoldTaxiBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-GoldBucket
+
   GlueScriptsBucketName:
     Description: Glue Scripts Bucket Name
     Value: !Ref GlueScriptsBucket
@@ -355,19 +647,21 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-GlueDatabase
 
-  LambdaFunctionArn:
-    Description: Lambda Function ARN
-    Value: !GetAtt TaxiExtractorFunction.Arn
-    Export:
-      Name: !Sub ${AWS::StackName}-LambdaArn
-
   LambdaFunctionName:
     Description: Lambda Function Name
     Value: !Ref TaxiExtractorFunction
 
-  GlueJobName:
-    Description: Glue ETL Job Name
+  SilverETLJobName:
+    Description: Bronze to Silver Glue Job Name
     Value: !Ref TaxiSilverTransformationJob
+
+  GoldFinanceJobName:
+    Description: Silver to Gold Finance Glue Job Name
+    Value: !Ref GoldFinanceJob
+
+  GoldOperationsJobName:
+    Description: Silver to Gold Operations Glue Job Name
+    Value: !Ref GoldOperationsJob
 
   BronzeCrawlerName:
     Description: Bronze Crawler Name
@@ -377,10 +671,27 @@ Outputs:
     Description: Silver Crawler Name
     Value: !Ref SilverTaxiCrawler
 
+  GoldCrawlerName:
+    Description: Gold Crawler Name
+    Value: !Ref GoldTaxiCrawler
+
+  GoldOperationsCrawlerName:
+    Description: Gold Crawler Name
+    Value: !Ref GoldOperationsCrawler
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref TaxiDataPipelineStateMachine
+
   DataCatalogConsoleURL:
     Description: Glue Data Catalog Console URL
     Value: !Sub https://${AWS::Region}.console.aws.amazon.com/glue/home?region=${AWS::Region}#/v2/data-catalog/databases/view/${TaxiDataCatalogDatabase}
 
-  GlueJobConsoleURL:
-    Description: Glue Job Console URL
-    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/gluestudio/home?region=${AWS::Region}#/editor/job/${TaxiSilverTransformationJob}/graph
+
+  NotificationTopicArn:
+    Description: SNS Topic for Pipeline Notifications
+    Value: !Ref PipelineNotificationTopic
+
+  StepFunctionsConsoleURL:
+    Description: Step Functions Console URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${TaxiDataPipelineStateMachine}

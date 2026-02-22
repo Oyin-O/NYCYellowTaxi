@@ -31,7 +31,7 @@ class TaxiDownloader:
         Get the previous month-year that would be passed into the default url for data download
         :return: previous month-year e.g '2025-01'
         """
-        prev_year_month = (date.today().replace(day=1) - timedelta(days=32)).strftime("%Y-%m")
+        prev_year_month = (date.today().replace(day=1) - timedelta(days=92)).strftime("%Y-%m")
         return prev_year_month
 
     @staticmethod
